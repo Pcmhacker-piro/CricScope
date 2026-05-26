@@ -2,11 +2,20 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import time
+import os
+import joblib
+import logging
 
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.metrics import accuracy_score
+from sklearn.ensemble import RandomForestClassifier
+from xgboost import XGBClassifier
+
+logging.basicConfig(level=logging.INFO)
 
 # -----------------------------------
 # CONFIG
@@ -812,8 +821,25 @@ team_data = {
 # -----------------------------------
 # MODEL
 # -----------------------------------
+def get_model(model_name='logistic'):
+    if model_name == 'logistic':
+        return LogisticRegression(max_iter=1000)
+    elif model_name == 'random_forest':
+        return RandomForestClassifier(n_estimators=100, random_state=42)
+    elif model_name == 'xgboost':
+        return XGBClassifier(n_estimators=100, random_state=42, use_label_encoder=False, eval_metric='logloss')
+    return LogisticRegression(max_iter=1000)
+
 @st.cache_resource
-def train_model():
+def train_model(model_name='logistic'):
+    model_path = f"{model_name}_model.pkl"
+
+    if os.path.exists(model_path):
+        try:
+            return joblib.load(model_path)
+        except Exception as e:
+            logging.error(f"Failed to load cached model from {model_path}: {e}")
+
     matches = pd.read_csv("matches.csv")
     deliveries = pd.read_csv("deliveries.csv")
 
@@ -827,9 +853,7 @@ def train_model():
 
     df['current_score'] = df.groupby('match_id')['total_runs'].cumsum()
     df['runs_left'] = df['target'] - df['current_score']
-    # Correct balls_left calculation using legal deliveries bowled:
-    # balls_bowled = ((over - 1) * 6) + ball
-    # and ensuring it is never negative.
+    
     balls_bowled = ((df['over'] - 1) * 6) + df['ball']
     df['balls_left'] = (120 - balls_bowled).clip(lower=0)
 
@@ -837,16 +861,11 @@ def train_model():
     df['wickets'] = df.groupby('match_id')['player_dismissed'].cumsum()
     df['wickets'] = 10 - df['wickets']
 
-    # Correct current run rate (crr) using correct overs bowled denominator:
-    # (over - 1) + (ball / 6)
     overs_bowled = (df['over'] - 1) + (df['ball'] / 6)
     df['crr'] = np.where(overs_bowled > 0, df['current_score'] / overs_bowled, 0.0)
-
-    # Correct required run rate (rrr) avoiding division by zero when balls_left is 0
     df['rrr'] = np.where(df['balls_left'] > 0, (df['runs_left'] * 6) / df['balls_left'], 0.0)
 
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
-
     df['result'] = np.where(df['batting_team'] == df['winner'], 1, 0)
 
     final_df = df[['batting_team', 'bowling_team', 'city',
@@ -857,6 +876,10 @@ def train_model():
     X = final_df.drop('result', axis=1)
     y = final_df['result']
 
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+
     preprocessor = ColumnTransformer([
         ('cat', OneHotEncoder(handle_unknown='ignore'), ['batting_team', 'bowling_team', 'city']),
         ('num', 'passthrough', ['runs_left', 'balls_left', 'wickets', 'target', 'crr', 'rrr'])
@@ -864,13 +887,31 @@ def train_model():
 
     pipe = Pipeline([
         ('preprocessor', preprocessor),
-        ('model', LogisticRegression(max_iter=1000))
+        ('model', get_model(model_name))
     ])
 
-    pipe.fit(X, y)
+    # Fit pipeline before evaluation metrics to avoid UnboundLocalError
+    pipe.fit(X_train, y_train)
+    predictions = pipe.predict(X_test)
+
+    # Log metrics
+    try:
+        scores = cross_val_score(pipe, X_train, y_train, cv=5)
+        logging.info(f"Model trained: {model_name}")
+        logging.info(f"Cross Validation Scores: {scores}")
+        logging.info(f"Average CV Accuracy: {scores.mean():.4f}")
+        logging.info(f"Test Accuracy: {accuracy_score(y_test, predictions):.4f}")
+    except Exception as eval_error:
+        logging.warning(f"Evaluation failed: {eval_error}")
+
+    try:
+        joblib.dump(pipe, model_path)
+    except Exception as dump_error:
+        logging.error(f"Failed to dump model to {model_path}: {dump_error}")
+
     return pipe
 
-pipe = train_model()
+pipe = train_model('logistic')
 
 # -----------------------------------
 # SIDEBAR
@@ -890,6 +931,15 @@ with st.sidebar:
 
     if st.button("◉  Match Analysis", key="nav_analysis"):
         st.session_state.page = "Analysis"
+
+    st.markdown('<div style="height:1px; background:rgba(212,175,55,0.08); margin:20px 0;"></div>', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-section-label">Model Selection</div>', unsafe_allow_html=True)
+    selected_model_name = st.selectbox(
+        "Choose Prediction Model",
+        ["Logistic Regression", "Random Forest", "XGBoost"],
+        index=0,
+        key="model_select"
+    )
 
     st.markdown('<div style="height:1px; background:rgba(212,175,55,0.08); margin:20px 0;"></div>', unsafe_allow_html=True)
     st.markdown('<div class="sidebar-section-label">Built By</div>', unsafe_allow_html=True)
@@ -1154,6 +1204,14 @@ if st.session_state.page == "Analysis":
 
     # ---- PREDICTION OUTPUT ----
     if analyze:
+        model_mapping = {
+            "Logistic Regression": "logistic",
+            "Random Forest": "random_forest",
+            "XGBoost": "xgboost"
+        }
+        selected_model_key = model_mapping[selected_model_name]
+        pipe = train_model(selected_model_key)
+
         runs_left = target - score
         balls_left = max(120 - (overs * 6), 0)
         crr = score / overs if overs > 0 else 0.0
